@@ -64,14 +64,16 @@ class KernelProxy(object):
     def __init__(self, manager, shell_upstream, session):
         self.manager = manager
         self.shell = self.manager.connect_shell()
-        self.shell_channel = ZMQSocketChannel(self.shell, session)
+        #self.shell_channel = ZMQSocketChannel(self.shell, session)
         self.shell_upstream = shell_upstream
         self.iopub_url = self.manager._make_url('iopub')
+        ##IOLoop.current().add_callback(self.relay_shell)
 
     async def relay_shell(self):
         """Coroutine for relaying any shell replies"""
         while True:
             msg = await self.shell.recv_multipart()
+            logging.warning('KernelProxy::relay_shell: received msg')
             self.shell_upstream.send_multipart(msg)
 
 
@@ -93,9 +95,10 @@ class AllTheKernels(Kernel):
         super().__init__(*args, **kwargs)
         self.future_context = ctx = Context()
         self.iosub = ctx.socket(zmq.SUB)
-        self.iosub_starting = ctx.socket(zmq.SUB)
-        self.iosub_starting_channel = ZMQSocketChannel(self.iosub_starting, self.session)
         self.iosub.subscribe = b''
+        self.iosub_starting = ctx.socket(zmq.SUB)
+        self.iosub_starting.subscribe = b''
+        self.iosub_starting_channel = ZMQSocketChannel(self.iosub_starting, self.session)
         self.shell_stream = self.shell_streams[0]
         logging.warning('==============================ATK instanciated')
 
@@ -133,27 +136,39 @@ class AllTheKernels(Kernel):
             session=self.session)
 
         self.iosub_starting.connect(kernel.iopub_url)
-       #--------------------------------------------------------
+        #--------------------------------------------------------
         logging.warning('start kernel before ensure ==============================')
         await self.ensure_kernel_connection(kernel)
         self.iosub_starting.disconnect(kernel.iopub_url)
         self.iosub.connect(kernel.iopub_url)
-        IOLoop.current().add_callback(kernel.relay_shell)
 
         #--------------------------------------------------------
         return self.kernels[name]
 
+    async def wait_msg(self, kernel):
+        logging.warning('===== BEFORE POLL ========')
+        ready = await kernel.shell.poll(1000)
+        logging.warning('===== AFTER POLL ========')
+        if ready:
+            logging.warning('===== BEFORE RECV========')
+            res = await kernel.shell._recv()
+            logging.warning('===== AFTER RECV ========')
+            return res
+        else:
+            logging.warning('===== RAISING EMPTY')
+            raise Empty
+
     async def ensure_kernel_connection(self, kernel):
         while True:
             logging.warning('sending kernel_info====================')
-            #kernel.kernel_info()
             info_msg = self.session.msg("kernel_info_request")
-            kernel.shell_channel.send(info_msg)
-            #self.session.send(kernel.shell, info_msg, ident=kernel.shell.get(zmq.IDENTITY))
+            #kernel.shell_channel.send(info_msg)
+            self.session.send(kernel.shell, info_msg, ident=kernel.shell.get(zmq.IDENTITY))
             try:
                 logging.warning('waiting for kernel_info_reply')
-                msg = await kernel.shell_channel.get_msg(timeout=1)
-            except Empty:
+                #msg = await kernel.shell_channel.get_msg(timeout=1)
+                msg = await self.wait_msg(kernel)
+            except:
                 logging.warning('did not receive kernel_info_reply')
                 pass
             else:
