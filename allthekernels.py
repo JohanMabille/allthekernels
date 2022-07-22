@@ -5,6 +5,7 @@ Like magic!
 
 import os
 import sys
+import logging
 
 from tornado.ioloop import IOLoop
 
@@ -16,8 +17,11 @@ from zmq.eventloop.future import Context
 from traitlets import Dict
 
 from jupyter_client import KernelManager
+from jupyter_client.channels import ZMQSocketChannel
 from ipykernel.kernelbase import Kernel
 from ipykernel.kernelapp import IPKernelApp
+
+from queue import Empty
 
 
 banner = """\
@@ -57,12 +61,12 @@ class KernelProxy(object):
 
     Hooks up relay of messages on the shell channel.
     """
-    def __init__(self, manager, shell_upstream):
+    def __init__(self, manager, shell_upstream, session):
         self.manager = manager
         self.shell = self.manager.connect_shell()
+        self.shell_channel = ZMQSocketChannel(self.shell, session)
         self.shell_upstream = shell_upstream
         self.iopub_url = self.manager._make_url('iopub')
-        IOLoop.current().add_callback(self.relay_shell)
 
     async def relay_shell(self):
         """Coroutine for relaying any shell replies"""
@@ -89,13 +93,17 @@ class AllTheKernels(Kernel):
         super().__init__(*args, **kwargs)
         self.future_context = ctx = Context()
         self.iosub = ctx.socket(zmq.SUB)
+        self.iosub_starting = ctx.socket(zmq.SUB)
+        self.iosub_starting_channel = ZMQSocketChannel(self.iosub_starting, self.session)
         self.iosub.subscribe = b''
         self.shell_stream = self.shell_streams[0]
+        logging.warning('==============================ATK instanciated')
 
     def start(self):
         super().start()
         loop = IOLoop.current()
         loop.add_callback(self.relay_iopub_messages)
+        logging.warning('======================ATK started')
 
     async def relay_iopub_messages(self):
         """Coroutine for relaying IOPub messages from all of our kernels"""
@@ -103,8 +111,9 @@ class AllTheKernels(Kernel):
             msg = await self.iosub.recv_multipart()
             self.iopub_socket.send_multipart(msg)
 
-    def start_kernel(self, name):
+    async def start_kernel(self, name):
         """Start a new kernel"""
+        logging.warning('entering start kernel==============================')
         base, ext = os.path.splitext(self.parent.connection_file)
         cf = '{base}-{name}{ext}'.format(
             base=base,
@@ -120,14 +129,59 @@ class AllTheKernels(Kernel):
         manager.start_kernel()
         self.kernels[name] = kernel = KernelProxy(
             manager=manager,
-            shell_upstream=self.shell_stream)
+            shell_upstream=self.shell_stream,
+            session=self.session)
+
+        self.iosub_starting.connect(kernel.iopub_url)
+       #--------------------------------------------------------
+        logging.warning('start kernel before ensure ==============================')
+        await self.ensure_kernel_connection(kernel)
+        self.iosub_starting.disconnect(kernel.iopub_url)
         self.iosub.connect(kernel.iopub_url)
+        IOLoop.current().add_callback(kernel.relay_shell)
+
+        #--------------------------------------------------------
         return self.kernels[name]
 
-    def get_kernel(self, name):
+    async def ensure_kernel_connection(self, kernel):
+        while True:
+            logging.warning('sending kernel_info====================')
+            #kernel.kernel_info()
+            info_msg = self.session.msg("kernel_info_request")
+            kernel.shell_channel.send(info_msg)
+            #self.session.send(kernel.shell, info_msg, ident=kernel.shell.get(zmq.IDENTITY))
+            try:
+                logging.warning('waiting for kernel_info_reply')
+                msg = await kernel.shell_channel.get_msg(timeout=1)
+            except Empty:
+                logging.warning('did not receive kernel_info_reply')
+                pass
+            else:
+                logging.warning('received kenel_info_reply')
+                if msg['msg_type'] == 'kernel_info_reply':
+                #Checking that IOPub is connected. If it is not connected, start over.
+                    try:
+                        logging.warning('waiting for status message')
+                        await self.iosub_starting_channel.get_msg(timeout=0.2)
+                    except Empty:
+                        logging.warning('did not receive status message')
+                        pass
+                    else:
+                        logging.warning('Received status message')
+                        self._handle_kernel_info_reply(msg)
+                        logging.warning('Handled kernel_info_message')
+                    break
+
+        while True:
+            try:
+                msg = await self.iosub_starting_channel.get_msg(timeout=0.2)
+            except Empty:
+                break
+
+    async def get_kernel(self, name):
         """Get a kernel, start it if it doesn't exist"""
         if name not in self.kernels:
-            self.start_kernel(name)
+            await self.start_kernel(name)
         return self.kernels[name]
 
     def set_parent(self, ident, parent, channel="shell"):
@@ -169,22 +223,27 @@ class AllTheKernels(Kernel):
         else:
             return super()._publish_status(status, channel, parent)
 
-    def relay_to_kernel(self, stream, ident, parent):
+    async def relay_to_kernel(self, stream, ident, parent):
         """Relay a message to a kernel
 
         Gets the `>kernel` line off of the cell,
         finds the kernel (starts it if necessary),
         then relays the request.
         """
+        logging.warning('===================================relay_to_kernel')
         content = parent['content']
         cell = content['code']
         kernel_name, cell = self.split_cell(cell)
         content['code'] = cell
-        kernel = self.get_kernel(kernel_name)
+        logging.warning('===================================relay_to_kernel before get_kernel')
+        kernel = await self.get_kernel(kernel_name)
         self.log.debug("Relaying %s to %s", parent['header']['msg_type'], kernel_name)
         self.session.send(kernel.shell, parent, ident=ident)
 
-    execute_request = relay_to_kernel
+    #execute_request = relay_to_kernel
+    async def execute_request(self, stream, ident, parent):
+        return await self.relay_to_kernel(stream, ident, parent)
+
     inspect_request = relay_to_kernel
     complete_request = relay_to_kernel
 
@@ -208,4 +267,5 @@ main = AllTheKernelsApp.launch_instance
 
 
 if __name__ == '__main__':
+    logging.warning("===== STARTING ATK =======")
     main()
